@@ -8,13 +8,16 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
+	"github.com/google/crfs/stargz"
 	imgtypes "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -27,7 +30,7 @@ const (
 
 var (
 	registry string
-	inode    uint64 = 0
+	inode    uint64 = 1
 )
 
 func main() {
@@ -67,37 +70,78 @@ type ccfs struct {
 }
 
 func (ccfs) Root() (fs.Node, error) {
-	return newDirectory(context.Background(), "", true), nil
+	return newRootDirectory(), nil
 }
 
-func newDirectory(ctx context.Context, name string, root bool) *directory {
+func newRootDirectory() *rootDirectory {
+	return &rootDirectory{
+		entries: map[string]fuseEntry{},
+	}
+}
+
+type rootDirectory struct {
+	entries map[string]fuseEntry
+}
+
+func (*rootDirectory) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Inode = 1
+	a.Mode = os.ModeDir | 0444
+	return nil
+}
+
+func (rd *rootDirectory) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	if obj, exists := rd.entries[name]; exists {
+		return obj.(fs.Node), nil
+	}
+	return nil, syscall.ENOENT
+}
+
+func (rd *rootDirectory) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	all := []fuse.Dirent{}
+	for _, entry := range rd.entries {
+		all = append(all, entry.entryInfo())
+	}
+	return all, nil
+}
+
+func (*rootDirectory) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+	return nil, nil, syscall.ENOTSUP
+}
+
+func (rd *rootDirectory) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
+	if strings.Trim(req.Name, " \n\t") == "" {
+		return nil, syscall.ENOTSUP
+	}
+	dir := newDirectory(ctx, req.Name)
+	rd.entries[req.Name] = dir
+	return dir, nil
+}
+
+type fuseEntry interface {
+	entryInfo() fuse.Dirent
+}
+
+func newDirectory(ctx context.Context, name string) *directory {
 	i := atomic.AddUint64(&inode, 1)
-	var index *imgtypes.Index
-	var desc *imgtypes.Descriptor
-	var err error
-	entries := map[string]fuseEntry{}
+	entries := map[string]*file{}
 	valid := true
-	if !root {
-		parts := strings.Split(name, ":")
-		imageName := parts[0]
-		imageTag := "latest"
-		if len(parts) > 2 {
-			imageTag = parts[1]
-		}
-		index, err = getIndex(ctx, imageName, imageTag)
+	reader, err := getStargzReader(ctx, name)
+	if err != nil {
+		logrus.WithError(err).Info("failed to create stargz reader")
+		valid = false
+	} else {
+		files, err := getFiles(name, reader)
 		if err != nil {
-			logrus.WithError(err).Infof("failed to get index for %s:%s", imageName, imageTag)
+			logrus.WithError(err).Error("failed to get files from stargz reader")
 			valid = false
 		} else {
-			desc = getManifestByMediaType(index, mediaTypeContainerdCheckpoint)
-			if desc == nil {
-				logrus.Infof("%s:%s is not a valid containerd checkpoint image", imageName, imageTag)
-				valid = false
+			for _, file := range files {
+				entries[file.Name] = file
 			}
 		}
 	}
 	if !valid {
-		invalid := newFile(".invalid")
+		invalid := newFile(name, ".invalid", 0, nil)
 		entries[invalid.Name] = invalid
 	}
 	return &directory{
@@ -107,22 +151,59 @@ func newDirectory(ctx context.Context, name string, root bool) *directory {
 			Type:  fuse.DT_Dir,
 		},
 		entries: entries,
-		root:    root,
 	}
-}
-
-func getFiles(ctx context.Context, name string, stargzDesc *imgtypes.Descriptor) ([]*file, error) {
-
-}
-
-type fuseEntry interface {
-	entryInfo() fuse.Dirent
 }
 
 type directory struct {
 	fuse.Dirent
-	entries map[string]fuseEntry
-	root    bool
+	reader  *stargz.Reader
+	entries map[string]*file
+}
+
+func getStargzReader(ctx context.Context, name string) (*stargz.Reader, error) {
+	parts := strings.Split(name, ":")
+	imageName := parts[0]
+	imageTag := "latest"
+	if len(parts) > 2 {
+		imageTag = parts[1]
+	}
+	index, err := getIndex(ctx, imageName, imageTag)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get index for %s:%s", imageName, imageTag)
+	}
+	desc := getManifestByMediaType(index, mediaTypeContainerdCheckpoint)
+	if desc == nil {
+		return nil, errors.Errorf("%s:%s is not a valid containerd checkpoint image", imageName, imageTag)
+	}
+	stargzURLTemp := "http://%s/v2/%s/blobs/%s"
+	stargzURL := fmt.Sprintf(stargzURLTemp, registry, imageName, string(desc.Digest))
+	reader, err := stargz.Open(
+		io.NewSectionReader(
+			&urlReaderAt{
+				url: stargzURL,
+			},
+			0,
+			desc.Size,
+		))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create stargz reader")
+	}
+	return reader, nil
+}
+
+func getFiles(parent string, reader *stargz.Reader) ([]*file, error) {
+	toc, exists := reader.Lookup("")
+	if !exists {
+		return nil, errors.New("failed to lookup root dir")
+	}
+	files := []*file{}
+	toc.ForeachChild(func(_ string, ent *stargz.TOCEntry) bool {
+		if ent.Type == "reg" {
+			files = append(files, newFile(parent, ent.Name, uint64(ent.Size), reader))
+		}
+		return true
+	})
+	return files, nil
 }
 
 func (d *directory) entryInfo() fuse.Dirent {
@@ -136,8 +217,8 @@ func (d *directory) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (d *directory) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	if obj, exists := d.entries[name]; exists {
-		return obj.(fs.Node), nil
+	if f, exists := d.entries[name]; exists {
+		return f, nil
 	}
 	return nil, syscall.ENOENT
 }
@@ -151,12 +232,7 @@ func (d *directory) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 }
 
 func (d *directory) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
-	if !d.root || strings.Trim(req.Name, " \n\t") == "" {
-		return nil, syscall.ENOTSUP
-	}
-	dir := newDirectory(ctx, req.Name, false)
-	d.entries[req.Name] = dir
-	return dir, nil
+	return nil, syscall.ENOTSUP
 }
 
 func (d *directory) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
@@ -165,10 +241,12 @@ func (d *directory) Create(ctx context.Context, req *fuse.CreateRequest, resp *f
 
 type file struct {
 	fuse.Dirent
-	size uint64
+	reader    *stargz.Reader
+	size      uint64
+	parentDir string
 }
 
-func newFile(name string) *file {
+func newFile(parent string, name string, size uint64, reader *stargz.Reader) *file {
 	i := atomic.AddUint64(&inode, 1)
 	return &file{
 		Dirent: fuse.Dirent{
@@ -176,6 +254,8 @@ func newFile(name string) *file {
 			Name:  name,
 			Type:  fuse.DT_File,
 		},
+		reader: reader,
+		size:   size,
 	}
 }
 
@@ -190,8 +270,60 @@ func (f *file) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
-func (f *file) ReadAll(ctx context.Context) ([]byte, error) {
-	return []byte{}, nil
+func (f *file) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	if !req.Flags.IsReadOnly() {
+		return nil, syscall.EACCES
+	}
+	var r *io.SectionReader
+	var err error
+	// reader is nil for .invalid file
+	if f.reader != nil {
+		r, err = f.reader.OpenFile(f.Name)
+		if err != nil {
+			logrus.WithError(err).Errorf("failed to open %s", path.Join(f.parentDir, f.Name))
+			return nil, syscall.EIO
+		}
+	}
+	h := &readHandler{
+		f:       f,
+		sReader: r,
+	}
+	resp.Handle = h.handleID()
+	logrus.Infof("open %s for read", path.Join(f.parentDir, f.Name))
+	return h, nil
+}
+
+type readHandler struct {
+	f       *file
+	sReader *io.SectionReader
+}
+
+func (rh *readHandler) handleID() fuse.HandleID {
+	return fuse.HandleID(uintptr(unsafe.Pointer(rh)))
+}
+
+func (rh *readHandler) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+
+	if rh.sReader == nil {
+		resp.Data = make([]byte, 0)
+		return nil
+	}
+	size := int(rh.f.size - uint64(req.Offset))
+	if req.Size < size {
+		size = req.Size
+	}
+	logrus.Infof("read %s at %v with size %v",
+		path.Join(rh.f.parentDir, rh.f.Name),
+		req.Offset,
+		size,
+	)
+	resp.Data = make([]byte, size)
+	_, err := rh.sReader.ReadAt(resp.Data, req.Offset)
+	if err != nil {
+		logrus.WithError(err).Errorf("failed to read %s", path.Join(rh.f.parentDir, rh.f.Name))
+		return syscall.EIO
+	}
+	return nil
 }
 
 func getIndex(ctx context.Context, name, tag string) (*imgtypes.Index, error) {
