@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -69,18 +70,23 @@ func main() {
 type ccfs struct {
 }
 
+type fuseEntry interface {
+	EntryInfo() fuse.Dirent
+}
+
 func (ccfs) Root() (fs.Node, error) {
 	return newRootDirectory(), nil
 }
 
 func newRootDirectory() *rootDirectory {
 	return &rootDirectory{
-		entries: map[string]fuseEntry{},
+		entries: map[string]*directory{},
 	}
 }
 
 type rootDirectory struct {
-	entries map[string]fuseEntry
+	sync.Mutex
+	entries map[string]*directory
 }
 
 func (*rootDirectory) Attr(ctx context.Context, a *fuse.Attr) error {
@@ -90,8 +96,8 @@ func (*rootDirectory) Attr(ctx context.Context, a *fuse.Attr) error {
 }
 
 func (rd *rootDirectory) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	if obj, exists := rd.entries[name]; exists {
-		return obj.(fs.Node), nil
+	if dir, exists := rd.entries[name]; exists {
+		return dir, nil
 	}
 	return nil, syscall.ENOENT
 }
@@ -99,7 +105,7 @@ func (rd *rootDirectory) Lookup(ctx context.Context, name string) (fs.Node, erro
 func (rd *rootDirectory) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	all := []fuse.Dirent{}
 	for _, entry := range rd.entries {
-		all = append(all, entry.entryInfo())
+		all = append(all, entry.EntryInfo())
 	}
 	return all, nil
 }
@@ -112,18 +118,24 @@ func (rd *rootDirectory) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.
 	if strings.Trim(req.Name, " \n\t") == "" {
 		return nil, syscall.ENOTSUP
 	}
-	dir := newDirectory(ctx, req.Name)
+	var dir *directory
+	var exists bool
+	if dir, exists = rd.entries[req.Name]; exists {
+		return nil, syscall.EEXIST
+	}
+	rd.Lock()
+	defer rd.Unlock()
+	if dir, exists = rd.entries[req.Name]; exists {
+		return dir, nil
+	}
+	dir = newDirectory(ctx, req.Name)
 	rd.entries[req.Name] = dir
 	return dir, nil
 }
 
-type fuseEntry interface {
-	entryInfo() fuse.Dirent
-}
-
 func newDirectory(ctx context.Context, name string) *directory {
 	i := atomic.AddUint64(&inode, 1)
-	entries := map[string]*file{}
+	entries := map[string]fuseEntry{}
 	valid := true
 	reader, err := getStargzReader(ctx, name)
 	if err != nil {
@@ -136,14 +148,17 @@ func newDirectory(ctx context.Context, name string) *directory {
 			valid = false
 		} else {
 			for _, file := range files {
-				entries[file.Name] = file
+				entries[file.EntryInfo().Name] = file
 			}
 		}
 	}
+	var endFile *staticFile
 	if !valid {
-		invalid := newFile(name, ".invalid", 0, nil)
-		entries[invalid.Name] = invalid
+		endFile = newStaticFile(name, ".end", "invalid", uint64(len("invalid")))
+	} else {
+		endFile = newStaticFile(name, ".end", "valid", uint64(len("valid")))
 	}
+	entries[endFile.Name] = endFile
 	return &directory{
 		Dirent: fuse.Dirent{
 			Inode: i,
@@ -157,7 +172,7 @@ func newDirectory(ctx context.Context, name string) *directory {
 type directory struct {
 	fuse.Dirent
 	reader  *stargz.Reader
-	entries map[string]*file
+	entries map[string]fuseEntry
 }
 
 func getStargzReader(ctx context.Context, name string) (*stargz.Reader, error) {
@@ -191,22 +206,22 @@ func getStargzReader(ctx context.Context, name string) (*stargz.Reader, error) {
 	return reader, nil
 }
 
-func getFiles(parent string, reader *stargz.Reader) ([]*file, error) {
+func getFiles(parent string, reader *stargz.Reader) ([]fuseEntry, error) {
 	toc, exists := reader.Lookup("")
 	if !exists {
 		return nil, errors.New("failed to lookup root dir")
 	}
-	files := []*file{}
+	files := []fuseEntry{}
 	toc.ForeachChild(func(_ string, ent *stargz.TOCEntry) bool {
 		if ent.Type == "reg" {
-			files = append(files, newFile(parent, ent.Name, uint64(ent.Size), reader))
+			files = append(files, newDynamicFile(parent, ent.Name, uint64(ent.Size), reader))
 		}
 		return true
 	})
 	return files, nil
 }
 
-func (d *directory) entryInfo() fuse.Dirent {
+func (d *directory) EntryInfo() fuse.Dirent {
 	return d.Dirent
 }
 
@@ -218,15 +233,19 @@ func (d *directory) Attr(ctx context.Context, a *fuse.Attr) error {
 
 func (d *directory) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	if f, exists := d.entries[name]; exists {
-		return f, nil
+		return f.(fs.Node), nil
 	}
 	return nil, syscall.ENOENT
+}
+
+func (d *directory) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
+	return syscall.ENOTSUP
 }
 
 func (d *directory) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	all := []fuse.Dirent{}
 	for _, entry := range d.entries {
-		all = append(all, entry.entryInfo())
+		all = append(all, entry.EntryInfo())
 	}
 	return all, nil
 }
@@ -241,25 +260,11 @@ func (d *directory) Create(ctx context.Context, req *fuse.CreateRequest, resp *f
 
 type file struct {
 	fuse.Dirent
-	reader    *stargz.Reader
 	size      uint64
 	parentDir string
 }
 
-func newFile(parent string, name string, size uint64, reader *stargz.Reader) *file {
-	i := atomic.AddUint64(&inode, 1)
-	return &file{
-		Dirent: fuse.Dirent{
-			Inode: i,
-			Name:  name,
-			Type:  fuse.DT_File,
-		},
-		reader: reader,
-		size:   size,
-	}
-}
-
-func (f *file) entryInfo() fuse.Dirent {
+func (f *file) EntryInfo() fuse.Dirent {
 	return f.Dirent
 }
 
@@ -270,31 +275,74 @@ func (f *file) Attr(ctx context.Context, a *fuse.Attr) error {
 	return nil
 }
 
-func (f *file) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+type dynamicFile struct {
+	file
+	reader *stargz.Reader
+}
+
+func newDynamicFile(parent string, name string, size uint64, reader *stargz.Reader) *dynamicFile {
+	i := atomic.AddUint64(&inode, 1)
+	return &dynamicFile{
+		file: file{
+			Dirent: fuse.Dirent{
+				Inode: i,
+				Name:  name,
+				Type:  fuse.DT_File,
+			},
+			size:      size,
+			parentDir: parent,
+		},
+		reader: reader,
+	}
+}
+
+func (df *dynamicFile) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
 	if !req.Flags.IsReadOnly() {
 		return nil, syscall.EACCES
 	}
 	var r *io.SectionReader
 	var err error
-	// reader is nil for .invalid file
-	if f.reader != nil {
-		r, err = f.reader.OpenFile(f.Name)
-		if err != nil {
-			logrus.WithError(err).Errorf("failed to open %s", path.Join(f.parentDir, f.Name))
-			return nil, syscall.EIO
-		}
+	r, err = df.reader.OpenFile(df.Name)
+	if err != nil {
+		logrus.WithError(err).Errorf("failed to open %s", path.Join(df.parentDir, df.Name))
+		return nil, syscall.EIO
 	}
 	h := &readHandler{
-		f:       f,
+		f:       df,
 		sReader: r,
 	}
 	resp.Handle = h.handleID()
-	logrus.Infof("open %s for read", path.Join(f.parentDir, f.Name))
+	logrus.Infof("open %s for read", path.Join(df.parentDir, df.Name))
 	return h, nil
 }
 
+type staticFile struct {
+	file
+	content string
+}
+
+func newStaticFile(parent, name, content string, size uint64) *staticFile {
+	i := atomic.AddUint64(&inode, 1)
+	return &staticFile{
+		file: file{
+			Dirent: fuse.Dirent{
+				Inode: i,
+				Type:  fuse.DT_File,
+				Name:  name,
+			},
+			size:      size,
+			parentDir: parent,
+		},
+		content: content,
+	}
+}
+
+func (sf *staticFile) ReadAll(ctx context.Context) ([]byte, error) {
+	return []byte(sf.content), nil
+}
+
 type readHandler struct {
-	f       *file
+	f       *dynamicFile
 	sReader *io.SectionReader
 }
 
@@ -303,7 +351,6 @@ func (rh *readHandler) handleID() fuse.HandleID {
 }
 
 func (rh *readHandler) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-
 	if rh.sReader == nil {
 		resp.Data = make([]byte, 0)
 		return nil
