@@ -114,6 +114,16 @@ func (*rootDirectory) Create(ctx context.Context, req *fuse.CreateRequest, resp 
 	return nil, nil, syscall.ENOTSUP
 }
 
+func (rd *rootDirectory) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
+	if _, exists := rd.entries[req.Name]; !exists {
+		return syscall.ENOENT
+	}
+	rd.Lock()
+	defer rd.Unlock()
+	delete(rd.entries, req.Name)
+	return nil
+}
+
 func (rd *rootDirectory) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
 	if strings.Trim(req.Name, " \n\t") == "" {
 		return nil, syscall.ENOTSUP
@@ -170,6 +180,7 @@ func newDirectory(ctx context.Context, name string) *directory {
 }
 
 type directory struct {
+	sync.Mutex
 	fuse.Dirent
 	reader  *stargz.Reader
 	entries map[string]fuseEntry
@@ -239,7 +250,13 @@ func (d *directory) Lookup(ctx context.Context, name string) (fs.Node, error) {
 }
 
 func (d *directory) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
-	return syscall.ENOTSUP
+	if _, exists := d.entries[req.Name]; !exists {
+		return syscall.ENOENT
+	}
+	d.Lock()
+	defer d.Unlock()
+	delete(d.entries, req.Name)
+	return nil
 }
 
 func (d *directory) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
