@@ -18,6 +18,7 @@ import (
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
+	"github.com/YLonely/ccfs/cache"
 	"github.com/google/crfs/stargz"
 	imgtypes "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -38,6 +39,12 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "ccfs"
 	app.Usage = "ccfs REGISTRY MOUNTPOINT"
+	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name:  "config",
+			Usage: "specifiy the path to the cache config",
+		},
+	}
 	app.Action = func(c *cli.Context) error {
 		registry = c.Args().Get(0)
 		if registry == "" {
@@ -46,6 +53,12 @@ func main() {
 		mountpoint := c.Args().Get(1)
 		if mountpoint == "" {
 			return errors.New("mountpoint must be provided")
+		}
+		configPath := c.String("config")
+		if configPath == "" {
+			logrus.Info("running ccfs without cache")
+		} else {
+
 		}
 		conn, err := fuse.Mount(
 			mountpoint,
@@ -68,6 +81,7 @@ func main() {
 }
 
 type ccfs struct {
+	config *cache.Config
 }
 
 type fuseEntry interface {
