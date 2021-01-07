@@ -65,12 +65,15 @@ func TestBlobCache(t *testing.T) {
 			n, err := bc.FetchAt(items[index].key, items[index].offset, cached)
 			if err != nil {
 				t.Errorf("failed to fetch data with key %s at %d with length %d, error %s", items[index].key, items[index].offset, len(cached), err.Error())
+				return
 			}
 			if n != len(cached) {
 				t.Errorf("length of read data mismatch, get %d, expect %d", n, len(cached))
+				return
 			}
 			if string(items[index].value[items[index].offset:]) != string(cached) {
 				t.Errorf("cached data error, get %s, expect %s", cached, items[index].value[items[index].offset:])
+				return
 			}
 		}(i)
 	}
