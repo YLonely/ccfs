@@ -87,16 +87,21 @@ func (c *WeightedBlobCache) Adjust(id string, weight float32) error {
 	return nil
 }
 
+func (c *WeightedBlobCache) entrySize() int {
+	current := 0
+	for _, cw := range c.caches {
+		current += cw.cache.len()
+	}
+	return current
+}
+
 func (c *WeightedBlobCache) cacheGC() {
 	if c.config.GCInterval <= 0 {
 		return
 	}
 	ticker := time.NewTicker(time.Second * time.Duration(c.config.GCInterval))
 	for {
-		currentEntries := 0
-		for _, cw := range c.caches {
-			currentEntries += cw.cache.len()
-		}
+		currentEntries := c.entrySize()
 		if currentEntries > c.config.MaxLRUCacheEntry {
 			c.Lock()
 			diff := currentEntries - c.config.MaxLRUCacheEntry
