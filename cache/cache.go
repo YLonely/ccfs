@@ -115,8 +115,9 @@ func (bc *blobCache) Add(key string, p []byte) error {
 		tmpFile.Close()
 		os.Remove(tmpFile.Name())
 	}()
-	expected := b.Len()
-	if _, err := io.CopyN(tmpFile, b, int64(expected)); err != nil {
+	expected := len(p)
+	reader := bytes.NewReader(p)
+	if _, err := io.CopyN(tmpFile, reader, int64(expected)); err != nil {
 		return errors.Wrap(err, "failed to write data to tmp file")
 	}
 	// commit
