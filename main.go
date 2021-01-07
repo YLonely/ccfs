@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,8 +34,13 @@ const (
 )
 
 var (
-	registry string
-	inode    uint64 = 1
+	registry   string
+	inode      uint64 = 1
+	bufferPool        = sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
+	}
 )
 
 func main() {
@@ -55,10 +63,24 @@ func main() {
 			return errors.New("mountpoint must be provided")
 		}
 		configPath := c.String("config")
+		config := &cache.Config{}
 		if configPath == "" {
 			logrus.Info("running ccfs without cache")
+			config = nil
 		} else {
-
+			data, err := ioutil.ReadFile(configPath)
+			if err != nil {
+				return errors.Wrap(err, "failed to read config")
+			}
+			if err = json.Unmarshal(data, config); err != nil {
+				return err
+			}
+			logrus.WithFields(logrus.Fields{
+				"directory":              config.Directory,
+				"level1MaxLRUCacheEntry": config.Level1MaxLRUCacheEntry,
+				"maxLRUCacheEntry":       config.MaxLRUCacheEntry,
+				"gcInterval":             config.GCInterval,
+			}).Info("running ccfs with cache")
 		}
 		conn, err := fuse.Mount(
 			mountpoint,
@@ -69,8 +91,7 @@ func main() {
 			return err
 		}
 		defer conn.Close()
-
-		if err = fs.Serve(conn, ccfs{}); err != nil {
+		if err = fs.Serve(conn, ccfs{config: config}); err != nil {
 			return err
 		}
 		return nil
@@ -88,19 +109,40 @@ type fuseEntry interface {
 	EntryInfo() fuse.Dirent
 }
 
-func (ccfs) Root() (fs.Node, error) {
-	return newRootDirectory(), nil
+type fuseSizedEntry interface {
+	fuseEntry
+	Size() uint64
 }
 
-func newRootDirectory() *rootDirectory {
-	return &rootDirectory{
+func (c ccfs) Root() (fs.Node, error) {
+	return newRootDirectory(c.config)
+}
+
+func newRootDirectory(config *cache.Config) (*rootDirectory, error) {
+	rd := &rootDirectory{
 		entries: map[string]*directory{},
+		config:  config,
 	}
+	if config == nil {
+		return rd, nil
+	}
+	wc, err := cache.NewWeightedBlobCache(config.Directory, cache.WeightedBlobCacheConfig{
+		Level1MaxLRUCacheEntry: config.Level1MaxLRUCacheEntry,
+		MaxLRUCacheEntry:       config.MaxLRUCacheEntry,
+		GCInterval:             config.GCInterval,
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create weighted cache")
+	}
+	rd.weightedCache = wc
+	return rd, nil
 }
 
 type rootDirectory struct {
 	sync.Mutex
-	entries map[string]*directory
+	entries       map[string]*directory
+	config        *cache.Config
+	weightedCache *cache.WeightedBlobCache
 }
 
 func (*rootDirectory) Attr(ctx context.Context, a *fuse.Attr) error {
@@ -152,12 +194,12 @@ func (rd *rootDirectory) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.
 	if dir, exists = rd.entries[req.Name]; exists {
 		return dir, nil
 	}
-	dir = newDirectory(ctx, req.Name)
+	dir = newDirectory(ctx, req.Name, rd.weightedCache)
 	rd.entries[req.Name] = dir
 	return dir, nil
 }
 
-func newDirectory(ctx context.Context, name string) *directory {
+func newDirectory(ctx context.Context, name string, wc *cache.WeightedBlobCache) *directory {
 	i := atomic.AddUint64(&inode, 1)
 	entries := map[string]fuseEntry{}
 	valid := true
@@ -166,7 +208,16 @@ func newDirectory(ctx context.Context, name string) *directory {
 		logrus.WithError(err).Info("failed to create stargz reader")
 		valid = false
 	} else {
-		files, err := getFiles(name, reader)
+		var bc cache.BlobCache
+		if wc != nil {
+			if err = wc.AddCache(name, 0); err == nil {
+				bc, _ = wc.GetCache(name)
+			} else {
+				valid = false
+				logrus.WithError(err).Errorf("failed to add cache with id %q", name)
+			}
+		}
+		files, err := getFiles(name, reader, bc)
 		if err != nil {
 			logrus.WithError(err).Error("failed to get files from stargz reader")
 			valid = false
@@ -178,25 +229,28 @@ func newDirectory(ctx context.Context, name string) *directory {
 	}
 	var endFile *staticFile
 	if !valid {
-		endFile = newStaticFile(name, ".end", "invalid", uint64(len("invalid")))
+		endFile = newStaticFile(name, ".end", "invalid")
 	} else {
-		endFile = newStaticFile(name, ".end", "valid", uint64(len("valid")))
+		if wc != nil {
+			wf := newWeightFile(name, ".weight", 0, 0, func(w float32) error {
+				return wc.Adjust(name, w)
+			})
+			entries[wf.name] = wf
+		}
+		endFile = newStaticFile(name, ".end", "valid")
 	}
-	entries[endFile.Name] = endFile
+	entries[endFile.name] = endFile
 	return &directory{
-		Dirent: fuse.Dirent{
-			Inode: i,
-			Name:  name,
-			Type:  fuse.DT_Dir,
-		},
+		inode:   i,
+		name:    name,
 		entries: entries,
 	}
 }
 
 type directory struct {
 	sync.Mutex
-	fuse.Dirent
-	reader  *stargz.Reader
+	inode   uint64
+	name    string
 	entries map[string]fuseEntry
 }
 
@@ -231,7 +285,7 @@ func getStargzReader(ctx context.Context, name string) (*stargz.Reader, error) {
 	return reader, nil
 }
 
-func getFiles(parent string, reader *stargz.Reader) ([]fuseEntry, error) {
+func getFiles(parent string, reader *stargz.Reader, bc cache.BlobCache) ([]fuseEntry, error) {
 	toc, exists := reader.Lookup("")
 	if !exists {
 		return nil, errors.New("failed to lookup root dir")
@@ -239,7 +293,7 @@ func getFiles(parent string, reader *stargz.Reader) ([]fuseEntry, error) {
 	files := []fuseEntry{}
 	toc.ForeachChild(func(_ string, ent *stargz.TOCEntry) bool {
 		if ent.Type == "reg" {
-			files = append(files, newDynamicFile(parent, ent.Name, uint64(ent.Size), reader))
+			files = append(files, newRemoteFile(parent, ent.Name, uint64(ent.Size), reader, bc))
 		}
 		return true
 	})
@@ -247,12 +301,26 @@ func getFiles(parent string, reader *stargz.Reader) ([]fuseEntry, error) {
 }
 
 func (d *directory) EntryInfo() fuse.Dirent {
-	return d.Dirent
+	return fuse.Dirent{
+		Inode: d.inode,
+		Type:  fuse.DT_Dir,
+		Name:  d.name,
+	}
 }
 
 func (d *directory) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Inode = d.Inode
+	var size uint64
+	d.Lock()
+	defer d.Unlock()
+	a.Inode = d.inode
 	a.Mode = os.ModeDir | 0444
+	for _, e := range d.entries {
+		sized, ok := e.(fuseSizedEntry)
+		if ok {
+			size += sized.Size()
+		}
+	}
+	a.Size = size
 	return nil
 }
 
@@ -290,60 +358,148 @@ func (d *directory) Create(ctx context.Context, req *fuse.CreateRequest, resp *f
 }
 
 type file struct {
-	fuse.Dirent
+	inode     uint64
+	name      string
+	mode      os.FileMode
 	size      uint64
 	parentDir string
 }
 
 func (f *file) EntryInfo() fuse.Dirent {
-	return f.Dirent
+	return fuse.Dirent{
+		Inode: f.inode,
+		Name:  f.name,
+		Type:  fuse.DT_File,
+	}
 }
 
 func (f *file) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Inode = f.Inode
-	a.Mode = 0444
+	a.Inode = f.inode
+	a.Mode = f.mode
 	a.Size = f.size
 	return nil
 }
 
-type dynamicFile struct {
-	file
-	reader *stargz.Reader
+func (f *file) Size() uint64 {
+	return f.size
 }
 
-func newDynamicFile(parent string, name string, size uint64, reader *stargz.Reader) *dynamicFile {
+type weightFile struct {
+	file
+	staticWeight int
+	dynamicWeght int
+	content      string
+	onChange     func(float32) error
+}
+
+func newWeightFile(parent string, name string, static, dynamic int, onChange func(float32) error) *weightFile {
 	i := atomic.AddUint64(&inode, 1)
-	return &dynamicFile{
+	content := fmt.Sprintf("%d,%d", static, dynamic)
+	return &weightFile{
 		file: file{
-			Dirent: fuse.Dirent{
-				Inode: i,
-				Name:  name,
-				Type:  fuse.DT_File,
-			},
+			inode:     i,
+			name:      name,
+			size:      uint64(len(content)),
+			mode:      0644,
+			parentDir: parent,
+		},
+		staticWeight: static,
+		dynamicWeght: dynamic,
+		content:      content,
+		onChange:     onChange,
+	}
+}
+
+func (wf *weightFile) ReadAll(ctx context.Context) ([]byte, error) {
+	return []byte(wf.content), nil
+}
+
+func (wf *weightFile) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
+	buf := bufferPool.Get().(*bytes.Buffer)
+	defer bufferPool.Put(buf)
+	buf.Reset()
+	buf.Write([]byte(wf.content)[:int(req.Offset)])
+	buf.Write(req.Data)
+	wf.content = buf.String()
+	wf.size = uint64(buf.Len())
+	resp.Size = buf.Len()
+	s, d, err := splitWeight(buf.String())
+	if err != nil {
+		logrus.WithError(err).Errorf("invalid file write to %s", path.Join(wf.parentDir, wf.name))
+	} else {
+		wf.staticWeight = s
+		wf.dynamicWeght = d
+		if wf.onChange != nil {
+			if err = wf.onChange(wf.weight()); err != nil {
+				logrus.WithError(err).Error("failed to call onChange handler")
+			}
+		}
+	}
+	return nil
+}
+
+func (wf *weightFile) weight() float32 {
+	total := float32(wf.staticWeight) + float32(wf.dynamicWeght)/10
+	if total > 20 {
+		return 20
+	}
+	return total
+}
+
+func splitWeight(content string) (int, int, error) {
+	parts := strings.Split(content, ",")
+	if len(parts) != 2 {
+		return 0, 0, errors.Errorf("invalid content %q", content)
+	}
+	static, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, errors.Wrapf(err, "failed to convert %q to number", parts[0])
+	}
+	dynamic, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, errors.Wrapf(err, "failed to convert %q to number", parts[1])
+	}
+	return static, dynamic, nil
+}
+
+type remoteFile struct {
+	file
+	reader *stargz.Reader
+	bc     cache.BlobCache
+}
+
+func newRemoteFile(parent string, name string, size uint64, reader *stargz.Reader, bc cache.BlobCache) *remoteFile {
+	i := atomic.AddUint64(&inode, 1)
+	return &remoteFile{
+		file: file{
+			inode:     i,
+			name:      name,
+			mode:      0444,
 			size:      size,
 			parentDir: parent,
 		},
 		reader: reader,
+		bc:     bc,
 	}
 }
 
-func (df *dynamicFile) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+func (rf *remoteFile) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
 	if !req.Flags.IsReadOnly() {
 		return nil, syscall.EACCES
 	}
 	var r *io.SectionReader
 	var err error
-	r, err = df.reader.OpenFile(df.Name)
+	r, err = rf.reader.OpenFile(rf.name)
 	if err != nil {
-		logrus.WithError(err).Errorf("failed to open %s", path.Join(df.parentDir, df.Name))
+		logrus.WithError(err).Errorf("failed to open %s", path.Join(rf.parentDir, rf.name))
 		return nil, syscall.EIO
 	}
 	h := &readHandler{
-		f:       df,
+		f:       rf,
 		sReader: r,
 	}
 	resp.Handle = h.handleID()
-	logrus.Infof("open %s for read", path.Join(df.parentDir, df.Name))
+	logrus.Debugf("open %s for read", path.Join(rf.parentDir, rf.name))
 	return h, nil
 }
 
@@ -352,16 +508,14 @@ type staticFile struct {
 	content string
 }
 
-func newStaticFile(parent, name, content string, size uint64) *staticFile {
+func newStaticFile(parent, name, content string) *staticFile {
 	i := atomic.AddUint64(&inode, 1)
 	return &staticFile{
 		file: file{
-			Dirent: fuse.Dirent{
-				Inode: i,
-				Type:  fuse.DT_File,
-				Name:  name,
-			},
-			size:      size,
+			inode:     i,
+			name:      name,
+			mode:      0444,
+			size:      uint64(len(content)),
 			parentDir: parent,
 		},
 		content: content,
@@ -373,7 +527,7 @@ func (sf *staticFile) ReadAll(ctx context.Context) ([]byte, error) {
 }
 
 type readHandler struct {
-	f       *dynamicFile
+	f       *remoteFile
 	sReader *io.SectionReader
 }
 
@@ -382,25 +536,88 @@ func (rh *readHandler) handleID() fuse.HandleID {
 }
 
 func (rh *readHandler) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	if rh.sReader == nil {
-		resp.Data = make([]byte, 0)
-		return nil
-	}
-	size := int(rh.f.size - uint64(req.Offset))
-	if req.Size < size {
-		size = req.Size
-	}
-	logrus.Infof("read %s at %v with size %v",
-		path.Join(rh.f.parentDir, rh.f.Name),
+	fullName := path.Join(rh.f.parentDir, rh.f.name)
+	logrus.Debugf("read %s at %v with size %v",
+		fullName,
 		req.Offset,
-		size,
+		req.Size,
 	)
-	resp.Data = make([]byte, size)
-	_, err := rh.sReader.ReadAt(resp.Data, req.Offset)
-	if err != nil {
-		logrus.WithError(err).Errorf("failed to read %s", path.Join(rh.f.parentDir, rh.f.Name))
-		return syscall.EIO
+	result := make([]byte, req.Size)
+	nr := 0
+	if rh.f.bc == nil {
+		// don't use cache at all
+		var err error
+		if nr, err = rh.sReader.ReadAt(result, req.Offset); err != nil && err != io.EOF {
+			logrus.WithError(err).Errorf(
+				"failed to read %s at %d with size %d from remote",
+				fullName,
+				req.Offset,
+				req.Size,
+			)
+		}
+	} else {
+		//use cache as much as possible
+		for nr < len(result) {
+			ce, ok := rh.f.reader.ChunkEntryForOffset(rh.f.name, req.Offset+int64(nr))
+			if !ok {
+				break
+			}
+			var (
+				id           = generateID(rh.f.name, ce.ChunkOffset, ce.ChunkSize)
+				lowerDiscard = positive(req.Offset - ce.ChunkOffset)
+				upperDiscard = positive(ce.ChunkOffset + ce.ChunkSize - (req.Offset + int64(len(result))))
+				expectedSize = ce.ChunkSize - upperDiscard - lowerDiscard
+			)
+			// try to fetch in cache
+			n, err := rh.f.bc.FetchAt(id, lowerDiscard, result[nr:int64(nr)+expectedSize])
+			if err != nil && int64(n) == expectedSize {
+				start := req.Offset + int64(nr)
+				logrus.Debugf("cache hit for file %s at range %d-%d", fullName, start, start+expectedSize)
+				nr += n
+				continue
+			}
+			// missed cache, take it from underlying reader and store it to the cache
+			buf := bufferPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			buf.Grow(int(ce.ChunkSize))
+			ip := buf.Bytes()[:ce.ChunkSize]
+			if _, err := rh.sReader.ReadAt(ip, ce.ChunkOffset); err != nil {
+				logrus.WithError(err).Errorf(
+					"failed to read %s at range %d-%d from remote",
+					fullName,
+					ce.ChunkOffset,
+					ce.ChunkSize,
+				)
+				return syscall.EIO
+			}
+			n = copy(result[nr:], ip[lowerDiscard:ce.ChunkSize-upperDiscard])
+			if int64(n) != expectedSize {
+				logrus.Errorf("unexpected copied data size %d, expected %d", n, expectedSize)
+				return syscall.EIO
+			}
+			// cache this chunk
+			go func() {
+				if err := rh.f.bc.Add(id, ip); err != nil {
+					logrus.WithError(err).Errorf(
+						"failed to cache range %d-%d for file %s",
+						ce.ChunkOffset,
+						ce.ChunkSize,
+						fullName,
+					)
+				} else {
+					logrus.Debugf(
+						"cache range %d-%d for file %s",
+						ce.ChunkOffset,
+						ce.ChunkSize,
+						fullName,
+					)
+				}
+				bufferPool.Put(buf)
+			}()
+			nr += n
+		}
 	}
+	resp.Data = result[:nr]
 	return nil
 }
 
@@ -466,4 +683,16 @@ func (r *urlReaderAt) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, errors.Wrapf(err, "range read of %s, status %v", r.url, res.Status)
 	}
 	return io.ReadFull(res.Body, p)
+}
+
+func generateID(s string, a, b int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%v-%v-%v", s, a, b)))
+	return fmt.Sprintf("%x", sum)
+}
+
+func positive(n int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	return n
 }

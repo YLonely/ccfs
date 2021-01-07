@@ -20,6 +20,9 @@ func NewWeightedBlobCache(directory string, config WeightedBlobCacheConfig) (*We
 	if config.MaxLRUCacheEntry == 0 {
 		config.MaxLRUCacheEntry = defaultMaxLRUCacheEntry
 	}
+	if config.GCInterval == 0 {
+		config.GCInterval = defaultGCInterval
+	}
 	if err := os.MkdirAll(directory, os.ModePerm); err != nil {
 		return nil, err
 	}
@@ -85,10 +88,10 @@ func (c *WeightedBlobCache) Adjust(id string, weight float32) error {
 }
 
 func (c *WeightedBlobCache) cacheGC() {
-	if c.config.gcInterval <= 0 {
+	if c.config.GCInterval <= 0 {
 		return
 	}
-	ticker := time.NewTicker(time.Second * time.Duration(c.config.gcInterval))
+	ticker := time.NewTicker(time.Second * time.Duration(c.config.GCInterval))
 	for {
 		currentEntries := 0
 		for _, cw := range c.caches {
@@ -115,7 +118,7 @@ func (c *WeightedBlobCache) cacheGC() {
 type WeightedBlobCacheConfig struct {
 	Level1MaxLRUCacheEntry int
 	MaxLRUCacheEntry       int
-	gcInterval             int
+	GCInterval             int
 }
 
 type cacheWrapper struct {

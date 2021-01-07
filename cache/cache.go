@@ -75,17 +75,20 @@ func (bc *blobCache) FetchAt(key string, offset int64, p []byte) (n int, err err
 
 func (bc *blobCache) Add(key string, p []byte) error {
 	// cache the data to memory
+	release := false
 	b := bc.bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		if release {
+			bc.bufPool.Put(b)
+		}
+	}()
 	b.Reset()
+	b.Grow(len(p))
 	b.Write(p)
 	if !bc.cache.add(key, newObject(b, func(v interface{}) { bc.bufPool.Put(b) })) {
-		bc.bufPool.Put(b)
+		release = true
 	}
 	// cache the data to disk
-	b2 := bc.bufPool.Get().(*bytes.Buffer)
-	b2.Reset()
-	b2.Write(p)
-	defer bc.bufPool.Put(b2)
 	cp, tp := bc.cachePath(key), bc.tmpPath(key)
 	bc.tmpLock.lock(key)
 	if _, err := os.Stat(tp); err == nil {
@@ -112,8 +115,8 @@ func (bc *blobCache) Add(key string, p []byte) error {
 		tmpFile.Close()
 		os.Remove(tmpFile.Name())
 	}()
-	expected := b2.Len()
-	if _, err := io.CopyN(tmpFile, b2, int64(expected)); err != nil {
+	expected := b.Len()
+	if _, err := io.CopyN(tmpFile, b, int64(expected)); err != nil {
 		return errors.Wrap(err, "failed to write data to tmp file")
 	}
 	// commit
