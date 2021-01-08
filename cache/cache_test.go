@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -114,20 +115,23 @@ func TestWeightedCache(t *testing.T) {
 	for i := range cacheIDs {
 		cacheIDs[i] = fmt.Sprintf("cache%d", i)
 	}
+	cws := make([]*cacheWrapper, 0, maxBlobCaches)
 	bcs := make([]BlobCache, 0, maxBlobCaches)
 	var weight float32
 	for _, id := range cacheIDs {
 		if err := wc.AddCache(id, weight); err != nil {
 			t.Fatal(err)
 		}
-		bc, err := wc.GetCache(id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		bcs = append(bcs, bc)
 		weight++
 	}
-	buildCache(t, bcs, itemsGroups)
+	for _, cw := range wc.caches {
+		cws = append(cws, cw)
+	}
+	sort.Sort(cacheHeap(cws))
+	for _, cw := range cws {
+		bcs = append(bcs, cw.cache)
+	}
+	buildCache(t, wc, cacheIDs, itemsGroups)
 	checkEntries(t, wc, cacheIDs, bcs, maxBlobCaches, maxItems)
 	// adjust weight
 	newIDs := []string{}
@@ -143,8 +147,8 @@ func TestWeightedCache(t *testing.T) {
 		w++
 	}
 
-	// rebuild cache
-	buildCache(t, bcs, itemsGroups)
+	// fetch cache
+	fetchCache(t, wc, cacheIDs, itemsGroups)
 	checkEntries(t, wc, newIDs, newbcs, maxBlobCaches, maxItems)
 }
 
@@ -171,17 +175,43 @@ func checkEntries(t *testing.T, wc *WeightedBlobCache, cacheIDs []string, bcs []
 	}
 }
 
-func buildCache(t *testing.T, bcs []BlobCache, itemsGroups [][]item) {
+func fetchCache(t *testing.T, wc *WeightedBlobCache, cacheIDs []string, itemsGroups [][]item) {
 	wg := sync.WaitGroup{}
-	for i := range bcs {
+	for i := range cacheIDs {
 		for _, it := range itemsGroups[i] {
 			wg.Add(1)
-			go func(index int, itt item) {
+			go func(id string, itt item) {
 				defer wg.Done()
-				if err := bcs[index].Add(itt.key, itt.value); err != nil {
+				cached := make([]byte, len(itt.value))
+				n, err := wc.FetchAt(id, itt.key, 0, cached)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if n != len(cached) {
+					t.Errorf("size of fetched data mismatch, get %d, expect %d", n, len(cached))
+					return
+				}
+				if string(cached) != string(itt.value) {
+					t.Errorf("content of feched data mismatch, get %s, expect %s", cached, itt.value)
+				}
+			}(cacheIDs[i], it)
+		}
+	}
+	wg.Wait()
+}
+
+func buildCache(t *testing.T, wc *WeightedBlobCache, cacheIDs []string, itemsGroups [][]item) {
+	wg := sync.WaitGroup{}
+	for i := range cacheIDs {
+		for _, it := range itemsGroups[i] {
+			wg.Add(1)
+			go func(id string, itt item) {
+				defer wg.Done()
+				if err := wc.Add(id, itt.key, itt.value); err != nil {
 					t.Errorf("failed to add item with key %s value %s", itt.key, itt.value)
 				}
-			}(i, it)
+			}(cacheIDs[i], it)
 		}
 	}
 	wg.Wait()
