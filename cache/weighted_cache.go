@@ -65,14 +65,30 @@ func (c *WeightedBlobCache) AddCache(id string, weight float32) error {
 	return nil
 }
 
-func (c *WeightedBlobCache) GetCache(id string) (BlobCache, error) {
+func (c *WeightedBlobCache) Add(id, key string, data []byte) error {
 	c.Lock()
-	defer c.Unlock()
 	cw, exists := c.caches[id]
 	if !exists {
-		return nil, os.ErrNotExist
+		c.Unlock()
+		return os.ErrNotExist
 	}
-	return cw.cache, nil
+	c.Unlock()
+	return cw.cache.Add(key, data)
+}
+
+func (c *WeightedBlobCache) FetchAt(id, key string, offset int64, data []byte) (int, error) {
+	c.Lock()
+	cw, exists := c.caches[id]
+	if !exists {
+		c.Unlock()
+		return 0, os.ErrNotExist
+	}
+	c.Unlock()
+	opts := []Option{}
+	if cw.cacheToMemory {
+		opts = append(opts, WithCacheToMemory)
+	}
+	return cw.cache.FetchAt(key, offset, data, opts...)
 }
 
 func (c *WeightedBlobCache) Adjust(id string, weight float32) error {
@@ -83,6 +99,7 @@ func (c *WeightedBlobCache) Adjust(id string, weight float32) error {
 		return os.ErrNotExist
 	}
 	cw.weight = weight
+	cw.cacheToMemory = true
 	heap.Fix(&c.hp, cw.index)
 	return nil
 }
@@ -108,6 +125,8 @@ func (c *WeightedBlobCache) cacheGC() {
 			cws := make([]*cacheWrapper, 0, diff/c.config.Level1MaxLRUCacheEntry+1)
 			for diff > 0 {
 				lowestWeightItem := heap.Pop(&c.hp).(*cacheWrapper)
+				// do not re-cache to memory to prevent the fluctuation of cache entries in mem
+				lowestWeightItem.cacheToMemory = false
 				diff -= lowestWeightItem.cache.reduce(diff)
 				cws = append(cws, lowestWeightItem)
 			}
@@ -127,9 +146,10 @@ type WeightedBlobCacheConfig struct {
 }
 
 type cacheWrapper struct {
-	cache  *blobCache
-	index  int
-	weight float32
+	cache         *blobCache
+	index         int
+	weight        float32
+	cacheToMemory bool
 }
 
 type cacheHeap []*cacheWrapper
