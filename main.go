@@ -208,16 +208,13 @@ func newDirectory(ctx context.Context, name string, wc *cache.WeightedBlobCache)
 		logrus.WithError(err).Info("failed to create stargz reader")
 		valid = false
 	} else {
-		var bc cache.BlobCache
 		if wc != nil {
-			if err = wc.AddCache(name, 0); err == nil {
-				bc, _ = wc.GetCache(name)
-			} else {
+			if err = wc.AddCache(name, 0); err != nil {
 				valid = false
 				logrus.WithError(err).Errorf("failed to add cache with id %q", name)
 			}
 		}
-		files, err := getFiles(name, reader, bc)
+		files, err := getFiles(name, reader, wc)
 		if err != nil {
 			logrus.WithError(err).Error("failed to get files from stargz reader")
 			valid = false
@@ -285,7 +282,7 @@ func getStargzReader(ctx context.Context, name string) (*stargz.Reader, error) {
 	return reader, nil
 }
 
-func getFiles(parent string, reader *stargz.Reader, bc cache.BlobCache) ([]fuseEntry, error) {
+func getFiles(parent string, reader *stargz.Reader, wc *cache.WeightedBlobCache) ([]fuseEntry, error) {
 	toc, exists := reader.Lookup("")
 	if !exists {
 		return nil, errors.New("failed to lookup root dir")
@@ -293,7 +290,7 @@ func getFiles(parent string, reader *stargz.Reader, bc cache.BlobCache) ([]fuseE
 	files := []fuseEntry{}
 	toc.ForeachChild(func(_ string, ent *stargz.TOCEntry) bool {
 		if ent.Type == "reg" {
-			files = append(files, newRemoteFile(parent, ent.Name, uint64(ent.Size), reader, bc))
+			files = append(files, newRemoteFile(parent, ent.Name, uint64(ent.Size), reader, wc))
 		}
 		return true
 	})
@@ -465,10 +462,10 @@ func splitWeight(content string) (int, int, error) {
 type remoteFile struct {
 	file
 	reader *stargz.Reader
-	bc     cache.BlobCache
+	wc     *cache.WeightedBlobCache
 }
 
-func newRemoteFile(parent string, name string, size uint64, reader *stargz.Reader, bc cache.BlobCache) *remoteFile {
+func newRemoteFile(parent string, name string, size uint64, reader *stargz.Reader, wc *cache.WeightedBlobCache) *remoteFile {
 	i := atomic.AddUint64(&inode, 1)
 	return &remoteFile{
 		file: file{
@@ -479,7 +476,7 @@ func newRemoteFile(parent string, name string, size uint64, reader *stargz.Reade
 			parentDir: parent,
 		},
 		reader: reader,
-		bc:     bc,
+		wc:     wc,
 	}
 }
 
@@ -544,7 +541,7 @@ func (rh *readHandler) Read(ctx context.Context, req *fuse.ReadRequest, resp *fu
 	)
 	result := make([]byte, req.Size)
 	nr := 0
-	if rh.f.bc == nil {
+	if rh.f.wc == nil {
 		// don't use cache at all
 		var err error
 		if nr, err = rh.sReader.ReadAt(result, req.Offset); err != nil && err != io.EOF {
@@ -563,13 +560,13 @@ func (rh *readHandler) Read(ctx context.Context, req *fuse.ReadRequest, resp *fu
 				break
 			}
 			var (
-				id           = generateID(rh.f.name, ce.ChunkOffset, ce.ChunkSize)
+				key          = generateKey(rh.f.name, ce.ChunkOffset, ce.ChunkSize)
 				lowerDiscard = positive(req.Offset - ce.ChunkOffset)
 				upperDiscard = positive(ce.ChunkOffset + ce.ChunkSize - (req.Offset + int64(len(result))))
 				expectedSize = ce.ChunkSize - upperDiscard - lowerDiscard
 			)
 			// try to fetch in cache
-			n, err := rh.f.bc.FetchAt(id, lowerDiscard, result[nr:int64(nr)+expectedSize])
+			n, err := rh.f.wc.FetchAt(rh.f.parentDir, key, lowerDiscard, result[nr:int64(nr)+expectedSize])
 			if err != nil && int64(n) == expectedSize {
 				start := req.Offset + int64(nr)
 				logrus.Debugf("cache hit for file %s at range %d-%d", fullName, start, start+expectedSize)
@@ -597,7 +594,7 @@ func (rh *readHandler) Read(ctx context.Context, req *fuse.ReadRequest, resp *fu
 			}
 			// cache this chunk
 			go func() {
-				if err := rh.f.bc.Add(id, ip); err != nil {
+				if err := rh.f.wc.Add(rh.f.parentDir, key, ip); err != nil {
 					logrus.WithError(err).Errorf(
 						"failed to cache range %d-%d for file %s",
 						ce.ChunkOffset,
@@ -685,7 +682,7 @@ func (r *urlReaderAt) ReadAt(p []byte, off int64) (n int, err error) {
 	return io.ReadFull(res.Body, p)
 }
 
-func generateID(s string, a, b int64) string {
+func generateKey(s string, a, b int64) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%v-%v-%v", s, a, b)))
 	return fmt.Sprintf("%x", sum)
 }

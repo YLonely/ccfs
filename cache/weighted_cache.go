@@ -43,12 +43,12 @@ type WeightedBlobCache struct {
 	caches    map[string]*cacheWrapper
 	directory string
 	config    WeightedBlobCacheConfig
-	sync.Mutex
+	mu        sync.Mutex
 }
 
 func (c *WeightedBlobCache) AddCache(id string, weight float32) error {
-	c.Lock()
-	defer c.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if _, exists := c.caches[id]; exists {
 		return nil
 	}
@@ -66,24 +66,24 @@ func (c *WeightedBlobCache) AddCache(id string, weight float32) error {
 }
 
 func (c *WeightedBlobCache) Add(id, key string, data []byte) error {
-	c.Lock()
+	c.mu.Lock()
 	cw, exists := c.caches[id]
 	if !exists {
-		c.Unlock()
+		c.mu.Unlock()
 		return os.ErrNotExist
 	}
-	c.Unlock()
+	c.mu.Unlock()
 	return cw.cache.Add(key, data)
 }
 
 func (c *WeightedBlobCache) FetchAt(id, key string, offset int64, data []byte) (int, error) {
-	c.Lock()
+	c.mu.Lock()
 	cw, exists := c.caches[id]
 	if !exists {
-		c.Unlock()
+		c.mu.Unlock()
 		return 0, os.ErrNotExist
 	}
-	c.Unlock()
+	c.mu.Unlock()
 	opts := []Option{}
 	if cw.cacheToMemory {
 		opts = append(opts, WithCacheToMemory)
@@ -92,8 +92,8 @@ func (c *WeightedBlobCache) FetchAt(id, key string, offset int64, data []byte) (
 }
 
 func (c *WeightedBlobCache) Adjust(id string, weight float32) error {
-	c.Lock()
-	defer c.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	cw, exists := c.caches[id]
 	if !exists {
 		return os.ErrNotExist
@@ -120,7 +120,7 @@ func (c *WeightedBlobCache) cacheGC() {
 	for {
 		currentEntries := c.entrySize()
 		if currentEntries > c.config.MaxLRUCacheEntry {
-			c.Lock()
+			c.mu.Lock()
 			diff := currentEntries - c.config.MaxLRUCacheEntry
 			cws := make([]*cacheWrapper, 0, diff/c.config.Level1MaxLRUCacheEntry+1)
 			for diff > 0 {
@@ -133,7 +133,7 @@ func (c *WeightedBlobCache) cacheGC() {
 			for _, cw := range cws {
 				heap.Push(&c.hp, cw)
 			}
-			c.Unlock()
+			c.mu.Unlock()
 		}
 		<-ticker.C
 	}
