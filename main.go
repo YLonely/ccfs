@@ -52,6 +52,10 @@ func main() {
 			Name:  "config",
 			Usage: "specifiy the path to the cache config",
 		},
+		cli.BoolFlag{
+			Name:  "debug",
+			Usage: "enable debug output in logs",
+		},
 	}
 	app.Action = func(c *cli.Context) error {
 		registry = c.Args().Get(0)
@@ -64,6 +68,11 @@ func main() {
 		}
 		configPath := c.String("config")
 		config := &cache.Config{}
+		if c.Bool("debug") {
+			logrus.SetLevel(logrus.DebugLevel)
+		} else {
+			logrus.SetLevel(logrus.InfoLevel)
+		}
 		if configPath == "" {
 			logrus.Info("running ccfs without cache")
 			config = nil
