@@ -19,7 +19,18 @@ const (
 // BlobCache caches data
 type BlobCache interface {
 	Add(key string, p []byte) error
-	FetchAt(key string, offset int64, p []byte) (n int, err error)
+	FetchAt(key string, offset int64, p []byte, opts ...Option) (n int, err error)
+}
+
+type cacheOpts struct {
+	cacheToMemory bool
+}
+
+type Option func(o *cacheOpts) error
+
+func WithCacheToMemory(o *cacheOpts) error {
+	o.cacheToMemory = true
+	return nil
 }
 
 func NewBlobCache(directory string, maxEntries int) (BlobCache, error) {
@@ -51,7 +62,13 @@ type blobCache struct {
 	bufPool   sync.Pool
 }
 
-func (bc *blobCache) FetchAt(key string, offset int64, p []byte) (n int, err error) {
+func (bc *blobCache) FetchAt(key string, offset int64, p []byte, opts ...Option) (n int, err error) {
+	copts := cacheOpts{}
+	for _, o := range opts {
+		if err := o(&copts); err != nil {
+			return 0, err
+		}
+	}
 	// get cached data from memory
 	if b, done, ok := bc.cache.get(key); ok {
 		defer done()
@@ -70,24 +87,15 @@ func (bc *blobCache) FetchAt(key string, offset int64, p []byte) (n int, err err
 	if n, err = file.ReadAt(p, offset); err == io.EOF {
 		err = nil
 	}
+	if copts.cacheToMemory {
+		bc.cacheToMemory(key, p)
+	}
 	return n, err
 }
 
 func (bc *blobCache) Add(key string, p []byte) error {
 	// cache the data to memory
-	release := false
-	b := bc.bufPool.Get().(*bytes.Buffer)
-	defer func() {
-		if release {
-			bc.bufPool.Put(b)
-		}
-	}()
-	b.Reset()
-	b.Grow(len(p))
-	b.Write(p)
-	if !bc.cache.add(key, newObject(b, func(v interface{}) { bc.bufPool.Put(b) })) {
-		release = true
-	}
+	bc.cacheToMemory(key, p)
 	// cache the data to disk
 	cp, tp := bc.cachePath(key), bc.tmpPath(key)
 	bc.tmpLock.lock(key)
@@ -128,6 +136,16 @@ func (bc *blobCache) Add(key string, p []byte) error {
 		return errors.Wrapf(err, "failed to commit the cache file %s", cp)
 	}
 	return nil
+}
+
+func (bc *blobCache) cacheToMemory(key string, data []byte) {
+	b := bc.bufPool.Get().(*bytes.Buffer)
+	b.Reset()
+	b.Grow(len(data))
+	b.Write(data)
+	if !bc.cache.add(key, newObject(b, func(v interface{}) { bc.bufPool.Put(v) })) {
+		bc.bufPool.Put(b)
+	}
 }
 
 func (bc *blobCache) len() int {
