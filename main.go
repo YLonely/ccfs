@@ -438,9 +438,15 @@ func (wf *weightFile) Write(ctx context.Context, req *fuse.WriteRequest, resp *f
 		if wf.onChange != nil {
 			if err = wf.onChange(wf.weight()); err != nil {
 				logrus.WithError(err).Error("failed to call onChange handler")
+			} else {
+				logrus.Infof("update the weight to %d,%d of checkpoint %s", s, d, wf.parentDir)
 			}
 		}
 	}
+	return nil
+}
+
+func (*weightFile) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	return nil
 }
 
@@ -453,6 +459,7 @@ func (wf *weightFile) weight() float32 {
 }
 
 func splitWeight(content string) (int, int, error) {
+	content = strings.Trim(content, " \n\t")
 	parts := strings.Split(content, ",")
 	if len(parts) != 2 {
 		return 0, 0, errors.Errorf("invalid content %q", content)
@@ -576,11 +583,14 @@ func (rh *readHandler) Read(ctx context.Context, req *fuse.ReadRequest, resp *fu
 			)
 			// try to fetch in cache
 			n, err := rh.f.wc.FetchAt(rh.f.parentDir, key, lowerDiscard, result[nr:int64(nr)+expectedSize])
-			if err != nil && int64(n) == expectedSize {
+			if err == nil && int64(n) == expectedSize {
 				start := req.Offset + int64(nr)
 				logrus.Debugf("cache hit for file %s at range %d-%d", fullName, start, start+expectedSize)
 				nr += n
 				continue
+			}
+			if err != nil {
+				logrus.WithError(err).Warnf("failed to fetch data of %s from cache", fullName)
 			}
 			// missed cache, take it from underlying reader and store it to the cache
 			buf := bufferPool.Get().(*bytes.Buffer)
