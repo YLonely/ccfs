@@ -3,12 +3,14 @@ package cache
 import (
 	"bytes"
 	"io"
+	"io/ioutil"
 	"os"
 	"path"
 	"sync"
 
 	"github.com/golang/groupcache/lru"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -88,7 +90,12 @@ func (bc *blobCache) FetchAt(key string, offset int64, p []byte, opts ...Option)
 		err = nil
 	}
 	if copts.cacheToMemory {
-		bc.cacheToMemory(key, p)
+		data, err := ioutil.ReadAll(file)
+		if err != nil {
+			logrus.WithError(err).Errorf("failed to read data from cached file for %q", key)
+		} else {
+			bc.cacheToMemory(key, data)
+		}
 	}
 	return n, err
 }
