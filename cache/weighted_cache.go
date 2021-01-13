@@ -9,19 +9,19 @@ import (
 )
 
 const (
-	defaultGCInterval = 5
+	DefaultGCInterval = 5
 )
 
 // NewWeightedBlobCache returns a new WeightedBlobCache
 func NewWeightedBlobCache(directory string, config WeightedBlobCacheConfig) (*WeightedBlobCache, error) {
-	if config.Level1MaxLRUCacheEntry == 0 {
-		config.Level1MaxLRUCacheEntry = defaultLevel1MaxLRUCacheEntry
+	if config.Level1MaxLRUCacheEntry <= 0 {
+		config.Level1MaxLRUCacheEntry = DefaultLevel1MaxLRUCacheEntry
 	}
-	if config.MaxLRUCacheEntry == 0 {
-		config.MaxLRUCacheEntry = defaultMaxLRUCacheEntry
+	if config.MaxLRUCacheEntry <= 0 {
+		config.MaxLRUCacheEntry = DefaultMaxLRUCacheEntry
 	}
-	if config.GCInterval == 0 {
-		config.GCInterval = defaultGCInterval
+	if config.GCInterval <= 0 {
+		config.GCInterval = DefaultGCInterval
 	}
 	if err := os.MkdirAll(directory, os.ModePerm); err != nil {
 		return nil, err

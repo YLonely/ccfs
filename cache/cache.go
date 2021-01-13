@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	defaultLevel1MaxLRUCacheEntry = 25
-	defaultMaxLRUCacheEntry       = 1 << 10
+	DefaultLevel1MaxLRUCacheEntry = 25
+	DefaultMaxLRUCacheEntry       = 1 << 10
 )
 
 // BlobCache caches data
@@ -37,7 +37,7 @@ func WithCacheToMemory(o *cacheOpts) error {
 
 func NewBlobCache(directory string, maxEntries int) (BlobCache, error) {
 	if maxEntries <= 0 {
-		maxEntries = defaultLevel1MaxLRUCacheEntry
+		maxEntries = DefaultLevel1MaxLRUCacheEntry
 	}
 	if err := os.MkdirAll(directory, os.ModePerm); err != nil {
 		return nil, err
@@ -94,6 +94,7 @@ func (bc *blobCache) FetchAt(key string, offset int64, p []byte, opts ...Option)
 		if err != nil {
 			logrus.WithError(err).Errorf("failed to read data from cached file for %q", key)
 		} else {
+			logrus.Debugf("re-cache data of key %q to memory", key)
 			bc.cacheToMemory(key, data)
 		}
 	}

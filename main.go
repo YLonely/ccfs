@@ -84,6 +84,18 @@ func main() {
 			if err = json.Unmarshal(data, config); err != nil {
 				return err
 			}
+			if config.Directory == "" {
+				return errors.New("cache directory must be provided")
+			}
+			if config.Level1MaxLRUCacheEntry <= 0 {
+				config.Level1MaxLRUCacheEntry = cache.DefaultLevel1MaxLRUCacheEntry
+			}
+			if config.MaxLRUCacheEntry <= 0 {
+				config.MaxLRUCacheEntry = cache.DefaultMaxLRUCacheEntry
+			}
+			if config.GCInterval <= 0 {
+				config.GCInterval = cache.DefaultGCInterval
+			}
 			logrus.WithFields(logrus.Fields{
 				"directory":              config.Directory,
 				"level1MaxLRUCacheEntry": config.Level1MaxLRUCacheEntry,
